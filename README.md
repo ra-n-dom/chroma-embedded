@@ -2,23 +2,76 @@
 
 High-performance ChromaDB server with built-in support for multiple state-of-the-art embedding models, enabling superior semantic search across PDFs, source code, and markdown with store-optimized chunking strategies.
 
-## 🚀 Quick Start
+## Prerequisites
+
+- **Docker Desktop** - [Install Docker](https://docs.docker.com/get-docker/)
+- **Python 3.8+** - Tested with 3.8 to 3.12
+- **8GB+ RAM** - allocated to Docker (for embedding models)
+- **10GB+ disk space** - (Docker image + model cache)
+
+### System Dependencies (for OCR)
+
+# macOS
+```bash
+brew install tesseract
+
+# Ubuntu/Debian
+sudo apt-get install tesseract-ocr
+
+# Or skip Tesseract and use EasyOCR (pure Python)
+pip install .[easyocr]
+```
+
+## First-time Setup
 
 ```bash
-# 1. Install dependencies (includes ASTChunk for source code)
+# 1. Clone and enter directory
+git clone <repository_url>
+cd chroma-embedded
+
+# 2. Create Python virtual environment (optional but recommended)
+python3 -m venv venv
+source venv/bin/activate
+
+# 3. Install Python dependencies
 pip install .
 
-# 2. Verify all dependencies
+# 4. Verify dependencies
 python3 check_deps.py
 
-# 3. Build the enhanced ChromaDB image (10-15 minutes)
+# 5. Create docker volumes for persistent storage
+docker volume create chromadb-data # Your collections and embeddings
+docker volume create chromadb-models # Hugging Face model cache (~2GB)
+
+# 6. Build the docker image
 ./build.sh
 
-# 4. Start server with Stella-400m embeddings
-./server.sh -m stella
+# 7. Start the server
+docker run -d --name chromadb-enhanced -p 9000:8000 -v chromadb-data:/data -v chromadb-models:/models chromadb-enhanced:latest
 
-# 5. Upload content with automatic model-optimized chunking
-# PDFs with OCR support (uses 460 tokens for Stella)
+# 8. Verify server is running
+curl http://localhost:9000/api/v2/heartbeat
+```
+
+**Note:** First startup downloads the Stella embedding model (~1.5GB). Subsequent startups use the cached model from the `chromadb-models` volume.
+
+### VPN Users
+
+If behind a VPN with SSL inspection, the model downloads may fail with certificate errors. Temporarily disable the VPN during the first startup to allow model downloads, or pre-download models manually into the `/models` volume.
+
+```bash
+# Activate virtual environment
+source venv/bin/activate
+
+# Start the server (if not running)
+docker start chromadb-enhanced
+
+# Or if the container was removed, recreate it:
+docker run -d --name chromadb-enhanced -p 9000:8000 -v chromadb-data:/data -v chromadb-models:/models chromadb-enhanced:latest
+```
+
+# Upload content with automatic model-optimized chunking
+# (upload.sh is a thin wrapper over the unified fast Python uploader)
 ./upload.sh -i /path/to/pdfs --store pdf -e stella -c ResearchLibrary
 
 # Source code with AST-aware chunking (uses 400 tokens for Stella)
@@ -35,7 +88,8 @@ python3 check_deps.py
 | `Dockerfile` | Multi-model ChromaDB Docker image |
 | `build.sh` | Build script for Docker image |
 | `server.sh` | Server management script |
-| `upload.sh` | Multi-format upload script (PDF, source code, markdown) |
+| `upload.sh` | Thin wrapper for the unified fast Python uploader |
+| `upload.py` | Unified uploader (PDF + OCR, source code, markdown) with persistent connections and parallelism |
 | `embedding_functions.py` | Enhanced embedding model implementations |
 | `test.sh` | Complete setup testing |
 | `check_deps.py` | Dependency checker (OCR + ASTChunk) |

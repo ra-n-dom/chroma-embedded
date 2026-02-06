@@ -262,7 +262,8 @@ def chunk_text(
     file_path: str,
     store_type: str,
     chunk_size_tokens: int = 400,
-    model_name: str = 'stella'
+    model_name: str = 'stella',
+    chunk_overlap_tokens: int = 0
 ) -> Tuple[List[str], str, Optional[List[Dict]]]:
     """
     Main chunking function that routes to appropriate chunking strategy.
@@ -289,5 +290,5 @@ def chunk_text(
 
     # Everything else: Use token-aware chunking
     else:
-        chunks = chunk_text_token_aware(text, chunk_size_tokens, 0, model_name)
+        chunks = chunk_text_token_aware(text, chunk_size_tokens, chunk_overlap_tokens, model_name)
         return chunks, 'token_aware', None

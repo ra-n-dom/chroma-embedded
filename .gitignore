@@ -61,4 +61,14 @@ sentence_transformers_cache/
 *.dockerfile.bak
 docker-compose.override.yml
 
-.claude
+.claude/
+
+# Local / machine-specific
+.python-version
+.chroma-uploads.json
+local-memory-pg.md
+
+# Mem-zen / Claude local files
+AGENTS.local.md
+CLAUDE.local.md
+MZ-PROJECT-KNOWLEDGE.md

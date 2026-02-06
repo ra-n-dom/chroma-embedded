@@ -10,3 +10,11 @@ mistune>=3.0.0
 # Optional: For advanced usage
 sentence-transformers>=5.1.0
 torch>=2.0.0
+
+# OCR dependencies (PDF image fallback)
+pillow>=10.0.0
+pytesseract>=0.3.10
+easyocr>=1.7.1
+
+# MCP Server for Claude Code integration
+chroma-mcp-server
