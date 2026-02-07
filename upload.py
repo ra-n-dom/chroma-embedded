@@ -118,6 +118,11 @@ def find_files(input_path: str, store_type: str, limit: int = None, git_depth: O
     files: List[str] = []
     abs_input = os.path.abspath(input_path)
 
+    if os.path.isfile(abs_input):
+        if any(abs_input.endswith(ext) for ext in extensions):
+            return [abs_input]
+        return []
+
     if store_type == 'source-code':
         git_projects = find_git_projects(abs_input, git_depth)
         if git_projects:

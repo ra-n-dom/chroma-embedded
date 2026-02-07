@@ -71,4 +71,5 @@ local-memory-pg.md
 # Mem-zen / Claude local files
 AGENTS.local.md
 CLAUDE.local.md
-MZ-PROJECT-KNOWLEDGE.md
+KF-PROJECT-KNOWLEDGE.md
+KF-RULES.md
