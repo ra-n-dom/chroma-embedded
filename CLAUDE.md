@@ -26,7 +26,9 @@ When working with Claude Code, use these exact commands:
 1. **Dockerfile** - Add model download commands
 2. **server.sh** - Add model validation and configuration
 3. **upload.sh** - Add model to valid options list
-4. **README.md** - Update model comparison table
+4. **embedding_functions.py** - Add to `MODEL_MAP`, `TRUST_REMOTE_CODE_MODELS` (if needed), and batch size in `get_embed_batch_size()`
+5. **chunk_utils.py** - Add char-per-token ratio in `model_char_ratios` dicts
+6. **README.md** - Update model comparison table
 
 ## Step-by-Step Model Addition
 

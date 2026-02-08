@@ -89,8 +89,11 @@ docker run -d --name chromadb-enhanced -p 9000:8000 -v chromadb-data:/data -v ch
 | `build.sh` | Build script for Docker image |
 | `server.sh` | Server management script |
 | `upload.sh` | Thin wrapper for the unified fast Python uploader |
-| `upload.py` | Unified uploader (PDF + OCR, source code, markdown) with persistent connections and parallelism |
-| `embedding_functions.py` | Enhanced embedding model implementations |
+| `upload.py` | Unified uploader (PDF + OCR, source code, markdown) with client-side MPS embedding |
+| `embedding_functions.py` | Client-side embedding: `detect_device()`, `load_model()`, `embed_documents()` + server-side classes |
+| `chunk_utils.py` | Token-aware, AST-aware, and markdown heading-aware chunking utilities |
+| `seed_manifest.py` | Seed `.chroma-uploads.json` manifest from existing ChromaDB collections |
+| `compare_manifest.py` | Compare filesystem repos to manifest (find un-uploaded repos) |
 | `test.sh` | Complete setup testing |
 | `check_deps.py` | Dependency checker (OCR + ASTChunk) |
 | `requirements.txt` | Python dependencies (includes ASTChunk) |
@@ -153,6 +156,45 @@ pip install .[easyocr]
 | **bge-large** | 1024 | Production deployments | 🏭 Battle-tested |
 | **default** | 384 | Quick testing, compatibility | ⚡ Fast, lightweight |
 
+## 🖥️ Client-Side Embedding (MPS / GPU)
+
+Embedding is performed **client-side** using Apple Silicon's Metal Performance Shaders (MPS) or CUDA on NVIDIA GPUs. The Docker container stores pre-computed vectors without running any embedding models.
+
+### Device Detection
+
+`detect_device()` automatically selects the best available device:
+1. **MPS** (Apple Silicon GPU) — preferred on macOS
+2. **CUDA** (NVIDIA GPU) — preferred on Linux
+3. **CPU** — fallback
+
+### Usage
+
+```bash
+# Default: auto-detect device (MPS on Apple Silicon)
+python3 upload.py -c projects -i /path/to/code --store source-code -e stella
+
+# Force CPU (disable GPU)
+python3 upload.py -c projects -i /path/to/code --store source-code -e stella --no-gpu
+```
+
+### Querying
+
+Queries must also embed client-side with the same model. The `cdbsp` and `cdbsd` bash functions handle this automatically — they load Stella locally and use `query_embeddings` instead of `query_texts`.
+
+```bash
+# Search source code (client-side Stella embedding)
+cdbsp "authentication middleware" 5
+
+# Search docs (client-side Stella embedding)
+cdbsd "deployment instructions" 5
+```
+
+**Do not use `query_texts`** directly against collections uploaded with client-side embedding — the server's default model produces different-dimension vectors, causing a dimension mismatch error.
+
+### Dimension Mismatch Protection
+
+If you try to upload to a collection that has embeddings with a different dimension (e.g., 384-dim from an old upload vs 1024-dim from Stella), the upload will abort with a clear message. Use `--delete-collection` to recreate with the correct dimensions.
+
 ## 📄 Store Types & Chunking Strategies
 
 The upload script supports three optimized store types, each with tailored chunking and metadata extraction:
@@ -195,7 +237,8 @@ The system automatically optimizes chunk sizes for each embedding model:
 
 - **Git Project-Aware**: Automatically detects `.git` directories and tracks project-level changes
 - **Smart Change Detection**: Compares git commit hashes to detect when projects need re-indexing
-- **Respects .gitignore**: Uses `git ls-files` to only index tracked files
+- **Respects .gitignore**: Uses `git ls-files` to only index tracked files (applies to all store types inside git repos)
+- **Skips Common Junk Directories**: `node_modules`, `.venv`, `venv`, `__pycache__`, `.tox`, `dist`, `build` are always excluded
 - **AST-Aware Chunking**: Respects function/class boundaries using ASTChunk
 - **Language Support**: 15+ programming languages (Python, Java, JS/TS, C#, Go, Rust, C/C++, PHP, Ruby, Kotlin, Scala, Swift)
 - **Enhanced Metadata**: Programming language, function/class detection, import analysis, line counts, git project context
@@ -220,7 +263,8 @@ When using `--store source-code`, the system automatically detects and manages g
 - **Automatic Discovery**: Finds `.git` directories to identify project boundaries
 - **Smart Change Detection**: Compares git commit hashes to detect when re-indexing is needed
 - **Clean Updates**: Deletes all existing chunks for a project when its commit hash changes
-- **Respects .gitignore**: Only indexes files tracked by git using `git ls-files`
+- **Respects .gitignore**: Uses `git ls-files` for all store types when inside a git repo (not just source-code)
+- **Skips Junk Directories**: `node_modules`, `.venv`, `__pycache__`, `dist`, `build` are always excluded from directory walks
 - **Project Metadata**: Every chunk includes git project context (name, commit hash, remote URL, branch)
 
 ### Depth Control
@@ -280,15 +324,22 @@ Each markdown chunk includes:
 # Process markdown documentation with heading-aware chunking
 ./upload.sh -i /path/to/markdown/docs --store markdown -e stella -c MarkdownDocs
 
-# Query by section using metadata filters
+# Query by section using metadata filters (client-side embedding required)
 python3 -c "
+import sys
+sys.path.insert(0, '.')
+from embedding_functions import load_model, embed_documents
 import chromadb
+
+model = load_model('stella')
+query_vec = embed_documents(model, ['How do I install?'])[0]
+
 client = chromadb.HttpClient(host='localhost', port=9000)
 collection = client.get_collection('MarkdownDocs')
 
 # Find all chunks from 'Installation' section
 results = collection.query(
-    query_texts=['How do I install?'],
+    query_embeddings=[query_vec],
     where={'markdown_primary_heading': 'Installation'},
     n_results=5
 )
@@ -498,25 +549,38 @@ When uploading large files (especially minified JavaScript or large source files
 
 ## 🏗️ Architecture
 
+Embeddings are computed **client-side** on Apple Silicon GPU (MPS) or CPU, not inside Docker. The Docker container is a pure storage layer.
+
+```mermaid
+flowchart TB
+    subgraph Client["Client (macOS / Apple Silicon)"]
+        direction TB
+        UPLOAD["upload.py<br/>PDFs + OCR, Source Code + AST, Markdown"]
+        QUERY["cdbsp / cdbsd<br/>query functions"]
+
+        subgraph GPU["Stella-400M on MPS (GPU)"]
+            EMBED["embed_documents()<br/>1024-dim vectors"]
+        end
+
+        DETECT["detect_device()<br/>mps / cuda / cpu"]
+    end
+
+    subgraph Docker["Docker Container (Storage Only)"]
+        CHROMA["ChromaDB Server :9000"]
+        STORE[("Collections<br/>projects (source-code, 1024d)<br/>docs (markdown/pdf, 1024d)")]
+    end
+
+    UPLOAD --> DETECT
+    QUERY --> DETECT
+    DETECT --> EMBED
+    UPLOAD -->|"documents + metadatas"| CHROMA
+    EMBED -->|"embeddings="| CHROMA
+    EMBED -->|"query_embeddings="| CHROMA
+    CHROMA --> STORE
+    CHROMA -->|"ranked results"| QUERY
 ```
-┌─────────────────┐    HTTP API    ┌──────────────────────────┐
-│  Multi-Format   │───────────────▶│  Enhanced ChromaDB       │
-│  Upload Client  │                │  Docker Container        │
-│  ┌─────────────┐ │                │  ┌─────────────────────┐ │
-│  │ PDFs + OCR  │ │                │  │ ChromaDB Server     │ │
-│  │ Source Code │ │                │  │ + Stella-400m       │ │
-│  │ + ASTChunk  │ │                │  │ + ModernBERT        │ │
-│  │ Docs + MD   │ │                │  │ + BGE-Large         │ │
-│  └─────────────┘ │                │  │ + Enhanced Metadata │ │
-└─────────────────┘                │  └─────────────────────┘ │
-                                   │                          │
-┌─────────────────┐    HTTP API    │  Store-Specific          │
-│  MCP Client     │───────────────▶│  Collections:            │
-│  (Claude Code   │                │  • ResearchLibrary (PDF) │
-│  semantic       │                │  • CodeLibrary (Source)  │
-│  queries)       │                │  • DocsLibrary (Docs)    │
-└─────────────────┘                └──────────────────────────┘
-```
+
+**Key**: Both uploads and queries embed client-side with the same Stella model, then pass pre-computed vectors to ChromaDB via `embeddings=` (uploads) or `query_embeddings=` (queries). The server never computes embeddings.
 
 ## 💻 Source Code Support
 
@@ -744,10 +808,10 @@ except:
 # Upload script configuration
 export PDF_INPUT_PATH=/path/to/files     # Input path (works with all store types)
 
-# Server configuration
-export CHROMA_EMBEDDING_MODEL=stella     # Server default model
-export TRANSFORMERS_CACHE=/models        # Model cache directory
-export HF_HOME=/models                   # Hugging Face cache directory
+# Server configuration (Docker container — storage only, no embedding)
+export CHROMA_EMBEDDING_MODEL=stella     # Legacy: server model (unused with client-side embedding)
+export TRANSFORMERS_CACHE=/models        # Model cache directory (inside Docker)
+export HF_HOME=/models                   # Hugging Face cache directory (inside Docker)
 
 # Store-specific defaults (optional)
 export DEFAULT_STORE_TYPE=pdf            # Default store type
@@ -942,12 +1006,12 @@ print(f'✅ ASTChunk test successful: {len(result)} chunks')
 
 ### Benefits
 
-- ✅ **Superior Embeddings**: Stella-400m, ModernBERT, BGE-Large vs default models
+- ✅ **Client-Side GPU Embedding**: Stella-400m on Apple Silicon MPS — no fan spin, fast uploads
 - ✅ **Multi-Format Support**: PDFs, source code, and markdown in one system
 - ✅ **AST-Aware Code Analysis**: Semantic chunking preserves function boundaries
 - ✅ **Enhanced Metadata**: Store-specific metadata for precise retrieval
 - ✅ **OCR Support**: Automatically processes image-only PDFs
-- ✅ **API Understanding**: Perfect for analyzing underdocumented codebases
+- ✅ **Dimension Mismatch Protection**: Catches mismatched embeddings before upload
 - ✅ **Centralized Management**: One server for all content types
 - ✅ **Research & Development Optimized**: Designed for technical workflows
 
