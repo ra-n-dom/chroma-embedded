@@ -534,32 +534,166 @@ def append_to_manifest(
     except Exception as e:
         print(f"  ⚠ Failed to update manifest: {e}")
 
-def check_if_upload_needed(
+def stash_if_dirty(input_path: str) -> Optional[str]:
+    """Stash uncommitted changes if the working tree is dirty.
+    Returns the git root path if stashed, None if clean or not a git repo.
+    """
+    work_dir = os.path.abspath(input_path) if os.path.isdir(input_path) else os.path.dirname(os.path.abspath(input_path))
+
+    try:
+        git_root = subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=work_dir, stderr=subprocess.PIPE, text=True
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+    # Check for uncommitted changes (staged + unstaged + untracked)
+    status = subprocess.check_output(
+        ['git', 'status', '--porcelain'],
+        cwd=git_root, stderr=subprocess.PIPE, text=True
+    ).strip()
+
+    if not status:
+        return None
+
+    print(f"  ⚠ Uncommitted changes detected — stashing before upload")
+    subprocess.check_call(
+        ['git', 'stash', 'push', '-u', '-m', 'chroma-upload: temporary stash'],
+        cwd=git_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    return git_root
+
+
+def stash_pop(git_root: str):
+    """Restore stashed changes."""
+    try:
+        subprocess.check_call(
+            ['git', 'stash', 'pop'],
+            cwd=git_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        print(f"  ✓ Restored stashed changes")
+    except subprocess.CalledProcessError:
+        print(f"  ⚠ Failed to pop stash — run 'git stash pop' manually in {git_root}")
+
+
+def get_changed_files(
+    input_path: str,
+    old_commit: str,
+    new_commit: str,
+    store_type: str
+) -> Dict[str, List[str]]:
+    """Get files changed between two commits, filtered by store type extensions.
+    Returns {'added': [...], 'modified': [...], 'deleted': [...]}
+    """
+    extensions = set(get_file_extensions(store_type))
+    result = {'added': [], 'modified': [], 'deleted': []}
+
+    work_dir = os.path.abspath(input_path) if os.path.isdir(input_path) else os.path.dirname(os.path.abspath(input_path))
+
+    try:
+        git_root = subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=work_dir, stderr=subprocess.PIPE, text=True
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return result
+
+    try:
+        diff_output = subprocess.check_output(
+            ['git', 'diff', '--name-status', old_commit, new_commit],
+            cwd=git_root, stderr=subprocess.PIPE, text=True
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return result
+
+    if not diff_output:
+        return result
+
+    for line in diff_output.split('\n'):
+        if not line.strip():
+            continue
+        parts = line.split('\t')
+        if len(parts) < 2:
+            continue
+
+        status = parts[0][0]  # First char handles R100 etc.
+
+        if status == 'R':
+            # Rename: old_path -> new_path
+            old_file = parts[1] if len(parts) > 1 else ''
+            new_file = parts[2] if len(parts) > 2 else ''
+            old_ext = os.path.splitext(old_file)[1].lower()
+            new_ext = os.path.splitext(new_file)[1].lower()
+            if old_ext in extensions:
+                result['deleted'].append(os.path.join(git_root, old_file))
+            if new_ext in extensions:
+                result['added'].append(os.path.join(git_root, new_file))
+        elif status == 'A':
+            file_path = parts[1]
+            if os.path.splitext(file_path)[1].lower() in extensions:
+                result['added'].append(os.path.join(git_root, file_path))
+        elif status == 'M':
+            file_path = parts[1]
+            if os.path.splitext(file_path)[1].lower() in extensions:
+                result['modified'].append(os.path.join(git_root, file_path))
+        elif status == 'D':
+            file_path = parts[1]
+            if os.path.splitext(file_path)[1].lower() in extensions:
+                result['deleted'].append(os.path.join(git_root, file_path))
+
+    return result
+
+
+def delete_file_chunks(collection, file_paths: List[str]) -> int:
+    """Delete all chunks for specific files from a collection.
+    Uses ChromaDB $in filter for batch delete — no ID fetching needed.
+    Returns count of paths processed.
+    """
+    if not file_paths:
+        return 0
+
+    # ChromaDB $in filter has a practical limit; batch if needed
+    batch_size = 50
+    total = 0
+    for i in range(0, len(file_paths), batch_size):
+        batch = file_paths[i:i + batch_size]
+        try:
+            collection.delete(where={"file_path": {"$in": batch}})
+            total += len(batch)
+        except Exception as e:
+            print(f"  ⚠ Failed to delete chunks for {len(batch)} files: {e}")
+
+    return total
+
+
+def get_upload_plan(
     client,
     collection_name: str,
     git_meta: Dict[str, str],
-    expected_file_count: int
-) -> bool:
+    all_files: List[str],
+    store_type: str,
+    input_path: str
+) -> Dict[str, Any]:
     """
-    Check if upload is needed based on git commit comparison AND manifest verification.
-    Returns True if upload needed, False if can skip.
+    Determine upload strategy: skip, full, or incremental.
+    Returns dict with 'action' key and relevant file lists.
     """
     project_name = git_meta.get('git_project_name')
     current_commit = git_meta.get('git_commit_hash')
 
     if not project_name or not current_commit:
-        # No git metadata, can't do incremental check
-        return True
+        return {'action': 'full', 'files': all_files}
 
     # Check manifest for last successful upload
     manifest_path = Path(__file__).parent / '.chroma-uploads.json'
+    manifest_commit = None
 
     try:
         if manifest_path.exists():
             with open(manifest_path, 'r') as f:
                 lines = f.readlines()
 
-            # Find most recent entry for this project
             for line in reversed(lines):
                 try:
                     entry = json.loads(line.strip())
@@ -567,40 +701,45 @@ def check_if_upload_needed(
                         manifest_commit = entry.get('git_commit')
                         manifest_files = entry.get('files', 0)
                         manifest_chunks = entry.get('chunks', 0)
-
-                        if manifest_commit == current_commit:
-                            # Same commit - check if upload completed successfully
-                            if manifest_files == expected_file_count:
-                                # Manifest shows complete upload
-                                print(f"  ✓ Project '{project_name}' unchanged (commit {current_commit[:8]})")
-                                print(f"  ✓ Last upload: {manifest_files} files → {manifest_chunks} chunks")
-                                print(f"  ⚠ Skipping upload (use --force to override)")
-                                return False
-                            else:
-                                # File count mismatch - incomplete upload
-                                print(f"  ⚠ Project '{project_name}' appears incomplete:")
-                                print(f"    Commit: {current_commit[:8]} (unchanged)")
-                                print(f"    Expected: {expected_file_count} files")
-                                print(f"    Last upload: {manifest_files} files → {manifest_chunks} chunks")
-                                print(f"    Will re-upload to complete")
-                                return True
-                        else:
-                            # Commit changed
-                            print(f"  ⚠ Project '{project_name}' changed:")
-                            print(f"    Old: {manifest_commit[:8] if manifest_commit else 'unknown'}")
-                            print(f"    New: {current_commit[:8]}")
-                            print(f"    Will upload changed files")
-                            return True
-
+                        break
                 except (json.JSONDecodeError, KeyError):
                     continue
 
     except Exception as e:
         print(f"  ⚠ Could not read manifest: {e}")
 
-    # No manifest entry found - proceed with upload
-    print(f"  ⚠ No previous upload found for '{project_name}'")
-    return True
+    if manifest_commit is None:
+        print(f"  ⚠ No previous upload found for '{project_name}'")
+        return {'action': 'full', 'files': all_files}
+
+    if manifest_commit == current_commit:
+        print(f"  ✓ Project '{project_name}' unchanged (commit {current_commit[:8]})")
+        print(f"  ✓ Last upload: {manifest_files} files → {manifest_chunks} chunks")
+        print(f"  ⚠ Skipping upload (use --force to override)")
+        return {'action': 'skip'}
+
+    # Commit changed — compute incremental diff
+    print(f"  ⚠ Project '{project_name}' changed:")
+    print(f"    Old: {manifest_commit[:8]}")
+    print(f"    New: {current_commit[:8]}")
+
+    changed = get_changed_files(input_path, manifest_commit, current_commit, store_type)
+    upload_files = changed['added'] + changed['modified']
+    delete_files = changed['deleted'] + changed['modified']  # modified = delete old + upload new
+
+    if not upload_files and not delete_files:
+        # git diff found no relevant file changes (e.g. only non-matching extensions changed)
+        print(f"    No relevant file changes detected — skipping")
+        return {'action': 'skip'}
+
+    print(f"    Changed: {len(changed['added'])} added, {len(changed['modified'])} modified, {len(changed['deleted'])} deleted")
+
+    return {
+        'action': 'incremental',
+        'upload': upload_files,
+        'delete': delete_files,
+        'old_commit': manifest_commit
+    }
 
 def process_file_batch(args_tuple):
     """
@@ -783,19 +922,45 @@ def main():
         print("❌ Input path is required unless using --delete-project")
         return
 
+    # Stash uncommitted changes so we only upload committed code
+    stashed_root = stash_if_dirty(args.input_path)
+
+    try:
+        _run_upload(args, client, collection)
+    finally:
+        if stashed_root:
+            stash_pop(stashed_root)
+
+
+def _run_upload(args, client, collection):
+    """Core upload logic, separated so main() can wrap it with stash/pop."""
     # Find files first (needed for completeness check)
     print("🔍 Finding files...")
     files = find_files(args.input_path, args.store, args.limit, args.depth)
     print(f"Found {len(files)} files")
     print()
 
-    # Check if incremental upload can skip this project
+    # Determine upload plan (skip / full / incremental)
+    incremental_delete = []
     if not args.delete_collection and not args.force:
         input_git_meta = get_git_metadata(args.input_path)
-        if not check_if_upload_needed(client, args.collection, input_git_meta, len(files)):
+        plan = get_upload_plan(client, args.collection, input_git_meta, files, args.store, args.input_path)
+
+        if plan['action'] == 'skip':
             print()
             print("✓ Upload skipped (no changes)")
             return
+        elif plan['action'] == 'incremental':
+            incremental_delete = plan.get('delete', [])
+            files = plan['upload']
+            # Delete old chunks for modified/deleted files
+            if incremental_delete:
+                print(f"\n🗑  Deleting chunks for {len(incremental_delete)} changed/removed files...")
+                deleted = delete_file_chunks(collection, incremental_delete)
+                print(f"  ✓ Deleted chunks for {deleted} files")
+            print(f"📤 Incremental: {len(files)} files to upload")
+            print()
+        # 'full' falls through to existing upload logic
 
     if len(files) == 0:
         print("No files to upload")

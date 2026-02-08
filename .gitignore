@@ -66,6 +66,7 @@ docker-compose.override.yml
 # Local / machine-specific
 .python-version
 .chroma-uploads.json
+.chroma-upload-progress.json
 local-memory-pg.md
 
 # Mem-zen / Claude local files
