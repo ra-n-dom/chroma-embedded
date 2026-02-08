@@ -7,6 +7,14 @@ Usage: python3 fast_upload.py --collection MyCollection --input /path/to/files -
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*deprecated.*")
+
+import logging
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 import argparse
 import chromadb
@@ -95,12 +103,15 @@ def get_file_extensions(store_type: str) -> List[str]:
     }
     return extensions.get(store_type, [])
 
+SKIP_DIRS = {'node_modules', '.venv', 'venv', '__pycache__', '.tox', 'dist', 'build'}
+
 def find_git_projects(input_path: str, depth: Optional[int] = None) -> List[str]:
     """Find git project roots within input_path, optionally limited by depth."""
     root = Path(input_path).resolve()
     git_projects: List[str] = []
 
     for current_root, dirnames, _ in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         current_path = Path(current_root)
         rel = current_path.relative_to(root)
 
@@ -125,37 +136,50 @@ def find_files(input_path: str, store_type: str, limit: int = None, git_depth: O
             return [abs_input]
         return []
 
-    if store_type == 'source-code':
-        git_projects = find_git_projects(abs_input, git_depth)
-        if git_projects:
-            for project_root in git_projects:
-                try:
-                    git_files = subprocess.check_output(
-                        ['git', 'ls-files'],
-                        cwd=project_root,
-                        stderr=subprocess.PIPE,
-                        text=True
-                    ).strip().split('\n')
-                except (subprocess.CalledProcessError, FileNotFoundError):
+    # Try git ls-files for any store type when inside a git repo
+    git_projects = find_git_projects(abs_input, git_depth) if store_type == 'source-code' else []
+
+    # For non-source-code stores, check if abs_input itself is a git repo
+    if not git_projects and store_type != 'source-code':
+        try:
+            subprocess.check_output(
+                ['git', 'rev-parse', '--show-toplevel'],
+                cwd=abs_input, stderr=subprocess.PIPE, text=True
+            ).strip()
+            git_projects = [abs_input]
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+
+    if git_projects:
+        for project_root in git_projects:
+            try:
+                git_files = subprocess.check_output(
+                    ['git', 'ls-files'],
+                    cwd=project_root,
+                    stderr=subprocess.PIPE,
+                    text=True
+                ).strip().split('\n')
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+
+            for git_file in git_files:
+                if not git_file:
                     continue
+                if not any(git_file.endswith(ext) for ext in extensions):
+                    continue
+                full_path = os.path.join(project_root, git_file)
+                if not full_path.startswith(abs_input):
+                    continue
+                files.append(full_path)
+                if limit and len(files) >= limit:
+                    return files
 
-                for git_file in git_files:
-                    if not git_file:
-                        continue
-                    if not any(git_file.endswith(ext) for ext in extensions):
-                        continue
-                    full_path = os.path.join(project_root, git_file)
-                    if not full_path.startswith(abs_input):
-                        continue
-                    files.append(full_path)
-                    if limit and len(files) >= limit:
-                        return files
+        print(f"  ✓ Using git ls-files ({len(files)} files, {len(git_projects)} git projects)")
+        return files
 
-            print(f"  ✓ Using git ls-files ({len(files)} files, {len(git_projects)} git projects)")
-            return files
-
-    # Fallback: Use os.walk for non-git directories or non-source-code stores
-    for root, _, filenames in os.walk(abs_input):
+    # Fallback: Use os.walk for non-git directories
+    for root, dirnames, filenames in os.walk(abs_input):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for filename in filenames:
             if any(filename.endswith(ext) for ext in extensions):
                 files.append(os.path.join(root, filename))
@@ -1061,7 +1085,7 @@ def _run_upload(args, client, collection, embed_device: str = "cpu"):
 
             if file_result.get('error'):
                 failed += 1
-                print(f"✗ [{i}/{len(files)}] {os.path.basename(file_path)} - FAILED")
+                print(f"\r✗ [{i}/{len(files)}] {os.path.basename(file_path)} - FAILED")
                 continue
 
             chunk_count = file_result['chunks']
@@ -1075,21 +1099,20 @@ def _run_upload(args, client, collection, embed_device: str = "cpu"):
             total_chunks += chunk_count
             processed += 1
 
-            print(f"✓ [{i}/{len(files)}] {os.path.basename(file_path)} ({chunk_count} chunks)")
-
             if len(current_batch['ids']) >= args.batch_size:
                 if not args.dry_run:
                     upload_batch(collection, current_batch, model=embed_model, embed_batch_size=embed_batch_size)
                     batches_uploaded += 1
                 current_batch = {'ids': [], 'documents': [], 'metadatas': []}
 
-            if i % 10 == 0:
-                elapsed = time.time() - start_time
-                rate = i / elapsed * 60
-                eta_seconds = (len(files) - i) / (i / elapsed) if elapsed > 0 else 0
-                eta_min = int(eta_seconds / 60)
-                print(f"  Progress: {i}/{len(files)} ({rate:.0f} files/min, ETA: {eta_min}min)")
+            # Single-line status bar (ANSI clear-to-end-of-line to avoid trailing chars)
+            elapsed = time.time() - start_time
+            rate = i / elapsed * 60 if elapsed > 0 else 0
+            eta_seconds = (len(files) - i) / (i / elapsed) if elapsed > 0 else 0
+            status = f"  [{i}/{len(files)}] {total_chunks} chunks | {rate:.0f} files/min | ETA: {int(eta_seconds)}s"
+            print(f"\r{status}\033[K", end="", flush=True)
 
+            if i % 10 == 0:
                 # Update progress file
                 input_git_meta = get_git_metadata(args.input_path)
                 update_progress({
@@ -1107,6 +1130,9 @@ def _run_upload(args, client, collection, embed_device: str = "cpu"):
                     'store_type': args.store,
                     'start_time': datetime.fromtimestamp(start_time).isoformat() + 'Z'
                 })
+
+        # Clear status line
+        print()
 
         if current_batch['ids']:
             if not args.dry_run:

@@ -75,7 +75,8 @@ def chunk_source_code_ast(
     text: str,
     file_path: str,
     chunk_size_tokens: int = 400,
-    model_name: str = 'stella'
+    model_name: str = 'stella',
+    verbose: bool = False
 ) -> Tuple[List[str], str]:
     """
     Chunk source code using AST-aware chunking.
@@ -123,24 +124,28 @@ def chunk_source_code_ast(
         chunks = [chunk_item['content'] for chunk_item in chunks_data]
 
         extraction_method = f'astchunk_{language}'
-        print(f'  ✓ AST-aware chunking: {len(chunks)} chunks for {language} code')
+        if verbose:
+            print(f'  ✓ AST-aware chunking: {len(chunks)} chunks for {language} code')
 
         return chunks, extraction_method
 
     except ImportError:
-        print('  ⚠ ASTChunk not available, using token-aware chunking')
+        if verbose:
+            print('  ⚠ ASTChunk not available, using token-aware chunking')
         chunks = chunk_text_token_aware(text, chunk_size_tokens, 0, model_name)
         return chunks, 'token_aware_fallback'
 
     except Exception as e:
-        print(f'  ⚠ ASTChunk failed ({e}), using token-aware chunking')
+        if verbose:
+            print(f'  ⚠ ASTChunk failed ({e}), using token-aware chunking')
         chunks = chunk_text_token_aware(text, chunk_size_tokens, 0, model_name)
         return chunks, 'token_aware_fallback'
 
 def chunk_markdown_heading_aware(
     text: str,
     chunk_size_tokens: int = 430,
-    model_name: str = 'stella'
+    model_name: str = 'stella',
+    verbose: bool = False
 ) -> Tuple[List[str], Optional[List[Dict]]]:
     """
     Chunk markdown text based on heading structure.
@@ -244,16 +249,19 @@ def chunk_markdown_heading_aware(
                 'markdown_heading_aware': True
             })
 
-        print(f'  ✓ Heading-aware chunking: {len(chunks)} chunks for markdown')
+        if verbose:
+            print(f'  ✓ Heading-aware chunking: {len(chunks)} chunks for markdown')
         return chunks, chunk_metadata
 
     except ImportError:
-        print('  ⚠ Mistune not available, using token-aware chunking')
+        if verbose:
+            print('  ⚠ Mistune not available, using token-aware chunking')
         chunks = chunk_text_token_aware(text, chunk_size_tokens, 0, model_name)
         return chunks, None
 
     except Exception as e:
-        print(f'  ⚠ Markdown parsing failed ({e}), using token-aware chunking')
+        if verbose:
+            print(f'  ⚠ Markdown parsing failed ({e}), using token-aware chunking')
         chunks = chunk_text_token_aware(text, chunk_size_tokens, 0, model_name)
         return chunks, None
 
