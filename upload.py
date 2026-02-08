@@ -5,9 +5,11 @@ Maintains persistent connection for massive speedup over upload.sh
 Usage: python3 fast_upload.py --collection MyCollection --input /path/to/files --store source-code
 """
 
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import argparse
 import chromadb
-import os
 import time
 import subprocess
 import json
@@ -458,16 +460,29 @@ def process_file(
         print(f"  ⚠ Error processing {file_path}: {e}")
         return {'ids': [], 'documents': [], 'metadatas': [], 'chunks': 0, 'error': str(e)}
 
-def upload_batch(collection, batch_data: Dict[str, list]) -> int:
-    """Upload a batch of chunks to ChromaDB"""
+def upload_batch(collection, batch_data: Dict[str, list], model=None, embed_batch_size: int = 64) -> int:
+    """Upload a batch of chunks to ChromaDB.
+    If model is provided, embeds client-side and sends pre-computed embeddings.
+    Otherwise falls back to server-side embedding.
+    """
     if not batch_data['ids']:
         return 0
 
-    collection.add(
-        ids=batch_data['ids'],
-        documents=batch_data['documents'],
-        metadatas=batch_data['metadatas']
-    )
+    if model is not None:
+        from embedding_functions import embed_documents
+        embeddings = embed_documents(model, batch_data['documents'], batch_size=embed_batch_size)
+        collection.add(
+            ids=batch_data['ids'],
+            documents=batch_data['documents'],
+            metadatas=batch_data['metadatas'],
+            embeddings=embeddings
+        )
+    else:
+        collection.add(
+            ids=batch_data['ids'],
+            documents=batch_data['documents'],
+            metadatas=batch_data['metadatas']
+        )
     return len(batch_data['ids'])
 
 def update_progress(progress_data: Dict[str, Any]):
@@ -566,15 +581,15 @@ def stash_if_dirty(input_path: str) -> Optional[str]:
 
 
 def stash_pop(git_root: str):
-    """Restore stashed changes."""
+    """Restore stashed changes (uses apply instead of pop for safety)."""
     try:
         subprocess.check_call(
-            ['git', 'stash', 'pop'],
+            ['git', 'stash', 'apply'],
             cwd=git_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        print(f"  ✓ Restored stashed changes")
+        print(f"  ✓ Restored stashed changes (stash kept — drop manually with 'git stash drop')")
     except subprocess.CalledProcessError:
-        print(f"  ⚠ Failed to pop stash — run 'git stash pop' manually in {git_root}")
+        print(f"  ⚠ Failed to apply stash — run 'git stash apply' manually in {git_root}")
 
 
 def get_changed_files(
@@ -748,14 +763,16 @@ def process_file_batch(args_tuple):
         files, worker_id, total_workers, collection_name,
         host, port, data_path, chunk_size, chunk_overlap,
         store_type, model_name, metadata_base, batch_size,
-        ocr_enabled, ocr_engine, ocr_language, dry_run
+        ocr_enabled, ocr_engine, ocr_language, dry_run,
+        embed_device
     )
     """
     (
         files, worker_id, total_workers, collection_name,
         host, port, data_path, chunk_size, chunk_overlap,
         store_type, model_name, metadata_base, batch_size,
-        ocr_enabled, ocr_engine, ocr_language, dry_run
+        ocr_enabled, ocr_engine, ocr_language, dry_run,
+        embed_device
     ) = args_tuple
 
     # Each worker creates its own connection
@@ -764,6 +781,15 @@ def process_file_batch(args_tuple):
     else:
         client = chromadb.HttpClient(host=host, port=int(port))
     collection = client.get_or_create_collection(name=collection_name)
+
+    # Each worker loads its own model for client-side embedding
+    from embedding_functions import load_model, get_embed_batch_size
+    if not dry_run:
+        worker_model = load_model(model_name, embed_device)
+        worker_embed_batch_size = get_embed_batch_size(model_name, embed_device)
+    else:
+        worker_model = None
+        worker_embed_batch_size = 64
 
     total_chunks = 0
     processed = 0
@@ -801,14 +827,14 @@ def process_file_batch(args_tuple):
         # Upload batch when it reaches batch_size
         if len(current_batch['ids']) >= batch_size:
             if not dry_run:
-                upload_batch(collection, current_batch)
+                upload_batch(collection, current_batch, model=worker_model, embed_batch_size=worker_embed_batch_size)
                 batches_uploaded += 1
             current_batch = {'ids': [], 'documents': [], 'metadatas': []}
 
     # Upload remaining chunks
     if current_batch['ids']:
         if not dry_run:
-            upload_batch(collection, current_batch)
+            upload_batch(collection, current_batch, model=worker_model, embed_batch_size=worker_embed_batch_size)
             batches_uploaded += 1
 
     return {
@@ -842,6 +868,7 @@ def main():
     parser.add_argument('--ocr-engine', default='tesseract', help='OCR engine: tesseract or easyocr')
     parser.add_argument('--ocr-language', default='eng', help='OCR language code')
     parser.add_argument('--depth', type=int, help='Git project search depth (source-code store)')
+    parser.add_argument('--no-gpu', action='store_true', help='Disable GPU, use CPU for embedding')
 
     args = parser.parse_args()
 
@@ -874,6 +901,10 @@ def main():
     if args.workers == 0:
         args.workers = max(1, cpu_count() // 2)  # Use half of CPU cores
 
+    # Detect embedding device
+    from embedding_functions import detect_device
+    embed_device = "cpu" if args.no_gpu else detect_device()
+
     print()
     print("=" * 50)
     print("Fast Upload to ChromaDB (Parallel)")
@@ -883,6 +914,7 @@ def main():
         print(f"Input: {args.input_path}")
     print(f"Store: {args.store}")
     print(f"Model: {args.embedding_model}")
+    print(f"Embedding device: {embed_device}")
     if args.data_path:
         print(f"Client: persistent ({args.data_path})")
     else:
@@ -926,13 +958,13 @@ def main():
     stashed_root = stash_if_dirty(args.input_path)
 
     try:
-        _run_upload(args, client, collection)
+        _run_upload(args, client, collection, embed_device)
     finally:
         if stashed_root:
             stash_pop(stashed_root)
 
 
-def _run_upload(args, client, collection):
+def _run_upload(args, client, collection, embed_device: str = "cpu"):
     """Core upload logic, separated so main() can wrap it with stash/pop."""
     # Find files first (needed for completeness check)
     print("🔍 Finding files...")
@@ -970,6 +1002,33 @@ def _run_upload(args, client, collection):
     print(f"Chunk size: {chunk_size} tokens")
     print(f"Chunk overlap: {chunk_overlap} tokens")
     print()
+
+    # Load embedding model client-side
+    from embedding_functions import load_model, get_embed_batch_size
+    if not args.dry_run:
+        print(f"⏳ Loading embedding model ({args.embedding_model}) on {embed_device}...")
+        model_start = time.time()
+        embed_model = load_model(args.embedding_model, embed_device)
+        embed_batch_size = get_embed_batch_size(args.embedding_model, embed_device)
+        print(f"✓ Model loaded in {time.time() - model_start:.1f}s (embed batch size: {embed_batch_size})")
+
+        # Check for dimension mismatch with existing collection
+        if not args.delete_collection and collection.count() > 0:
+            sample = collection.get(limit=1, include=["embeddings"])
+            existing_embs = sample.get("embeddings")
+            if existing_embs is not None and len(existing_embs) > 0:
+                existing_dim = len(existing_embs[0])
+                model_dim = embed_model.get_sentence_embedding_dimension()
+                if existing_dim != model_dim:
+                    print(f"❌ Dimension mismatch: collection has {existing_dim}-dim embeddings, "
+                          f"but {args.embedding_model} produces {model_dim}-dim")
+                    print(f"   Re-upload with --delete-collection to recreate with correct dimensions")
+                    return
+
+        print()
+    else:
+        embed_model = None
+        embed_batch_size = 64
 
     if args.dry_run:
         print("Dry run: chunking without upload")
@@ -1020,7 +1079,7 @@ def _run_upload(args, client, collection):
 
             if len(current_batch['ids']) >= args.batch_size:
                 if not args.dry_run:
-                    upload_batch(collection, current_batch)
+                    upload_batch(collection, current_batch, model=embed_model, embed_batch_size=embed_batch_size)
                     batches_uploaded += 1
                 current_batch = {'ids': [], 'documents': [], 'metadatas': []}
 
@@ -1051,7 +1110,7 @@ def _run_upload(args, client, collection):
 
         if current_batch['ids']:
             if not args.dry_run:
-                upload_batch(collection, current_batch)
+                upload_batch(collection, current_batch, model=embed_model, embed_batch_size=embed_batch_size)
                 batches_uploaded += 1
 
     else:
@@ -1074,7 +1133,8 @@ def _run_upload(args, client, collection):
                 worker_files, worker_id, args.workers, args.collection,
                 args.host, args.port, args.data_path, chunk_size, chunk_overlap,
                 args.store, args.embedding_model, metadata_base, args.batch_size,
-                not args.disable_ocr, args.ocr_engine, args.ocr_language, args.dry_run
+                not args.disable_ocr, args.ocr_engine, args.ocr_language, args.dry_run,
+                embed_device
             ))
 
         # Run workers in parallel
